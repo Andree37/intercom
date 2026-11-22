@@ -18,7 +18,7 @@ type hookInput struct {
 }
 
 func cmdHook(args []string) {
-	if len(args) == 0 {
+	if len(args) == 0 || os.Getenv("IC_SKIP") == "1" { // helper sessions (e.g. code-tree's classifier) stay out
 		return
 	}
 	var in hookInput
