@@ -38,6 +38,13 @@ ic name reviewer                     # rename this session
 ic log                               # recent messages to or from you
 ```
 
+## The pane
+
+`ic watch` is a live view for a terminal pane: every session with its herdr state, every message as it
+flows, and your unread mail highlighted. Pick a session and press `enter` to message it, `a` to ask and
+wait, `i` to read your inbox, `f` to jump to its herdr pane. In herdr, the
+[herdr-intercom](https://github.com/Andree37/herdr-intercom) plugin opens it with a key.
+
 Inside a session, `ic` knows who it is from `IC_ID`, which the SessionStart hook exports. A session
 gets a default name from its folder (`code-tree`, `code-tree-2`, ...).
 

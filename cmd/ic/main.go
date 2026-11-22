@@ -28,6 +28,7 @@ var commands = []command{
 	{"reply", "MSGID TEXT...", "answer a message", cmdReply},
 	{"inbox", "[--peek]", "print unread messages and mark them read", cmdInbox},
 	{"log", "[N]", "last N messages to or from this session", cmdLog},
+	{"watch", "", "live pane: sessions, all messages, your inbox; message anyone", cmdWatch},
 	{"hook", "EVENT", "Claude Code hook entry (session-start, prompt, tool, stop, session-end)", cmdHook},
 	{"install", "claude", "add ic hooks to ~/.claude/settings.json (needs jq)", cmdInstall},
 }
