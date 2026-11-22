@@ -38,7 +38,7 @@ func cmdWho(args []string) {
 		if h, _ := os.UserHomeDir(); h != "" {
 			cwd = strings.Replace(cwd, h, "~", 1)
 		}
-		fmt.Printf("%-22s %-7s %-8s %-9s %-8s %s%s\n", s.Name, s.Kind, short(s.ID), st, dash(s.Pane), cwd, mark)
+		fmt.Printf("%-22s %-7s %-8s %-9s %-8s %s%s\n", clean(s.Name), s.Kind, short(s.ID), st, dash(s.Pane), clean(cwd), mark)
 	}
 	if n := len(unread("human")); n > 0 {
 		fmt.Printf("\nhuman has %d unread message(s): ic inbox\n", n)
@@ -54,8 +54,8 @@ func dash(s string) string {
 
 func cmdName(args []string) {
 	name := joinText(args)
-	if name == "" || strings.ContainsAny(name, " \t") {
-		die("usage: ic name NAME (one word)")
+	if name == "" || strings.ContainsAny(name, " \t") || clean(name) != name {
+		die("usage: ic name NAME (one word, no control characters)")
 	}
 	s := self()
 	if s.Kind == "human" {
@@ -101,6 +101,7 @@ func send(to, kind, re, topic, question, body string, wake bool) *Message {
 func cmdSend(args []string) {
 	topic, _, args := flag(args, "topic", true)
 	_, noWake, args := flag(args, "no-wake", false)
+	args = positional(args)
 	if len(args) < 2 {
 		die("usage: ic send TO TEXT... [--topic T] [--no-wake]")
 	}
@@ -114,6 +115,7 @@ func cmdAsk(args []string) {
 	topic, _, args := flag(args, "topic", true)
 	tv, _, args := flag(args, "timeout", true)
 	_, noWake, args := flag(args, "no-wake", false)
+	args = positional(args)
 	if len(args) < 2 {
 		die("usage: ic ask TO TEXT... [--timeout SECONDS] [--topic T]")
 	}
@@ -175,7 +177,7 @@ func cmdInbox(args []string) {
 	me := self()
 	if peek {
 		for _, m := range unread(me.ID) {
-			fmt.Printf("%s  from %s  %s\n", m.ID, nameOf(m.From), oneLine(m.Body))
+			fmt.Printf("%s  from %s  %s\n", m.ID, clean(nameOf(m.From)), clean(oneLine(m.Body)))
 		}
 		return
 	}
@@ -199,7 +201,7 @@ func cmdLog(args []string) {
 	for _, l := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		f := strings.SplitN(l, "\t", 6)
 		if len(f) == 6 && (f[1] == me.ID || f[2] == me.ID) {
-			lines = append(lines, fmt.Sprintf("%s  %s → %s  [%s] %s", f[0][11:16], nameOf(f[1]), nameOf(f[2]), f[4], f[5]))
+			lines = append(lines, clean(fmt.Sprintf("%s  %s → %s  [%s] %s", f[0][11:16], nameOf(f[1]), nameOf(f[2]), f[4], f[5])))
 		}
 	}
 	if len(lines) > n {

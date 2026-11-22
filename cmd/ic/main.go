@@ -61,13 +61,15 @@ func main() {
 	die("unknown command %q (see `ic --help`)", os.Args[1])
 }
 
-// flag pulls "--name value" or "--name" (bool) out of args.
+// flag pulls "--name value" or "--name" (bool) out of args. It stops at "--"
+// and keeps it, so a later flag call stops there too; positional drops it once
+// every flag is read.
 func flag(args []string, name string, takesValue bool) (string, bool, []string) {
 	var rest []string
 	val, found := "", false
 	for k := 0; k < len(args); k++ {
 		if args[k] == "--" {
-			rest = append(rest, args[k+1:]...)
+			rest = append(rest, args[k:]...)
 			break
 		}
 		if args[k] == "--"+name {
@@ -81,6 +83,17 @@ func flag(args []string, name string, takesValue bool) (string, bool, []string) 
 		rest = append(rest, args[k])
 	}
 	return val, found, rest
+}
+
+// positional is what is left after the flags, with the first "--" removed:
+// everything after it is text, even "--no-wake".
+func positional(args []string) []string {
+	for k, a := range args {
+		if a == "--" {
+			return append(append([]string{}, args[:k]...), args[k+1:]...)
+		}
+	}
+	return args
 }
 
 func joinText(args []string) string { return strings.TrimSpace(strings.Join(args, " ")) }

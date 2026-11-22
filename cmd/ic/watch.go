@@ -4,12 +4,14 @@ package main
 // message it), every message below as it flows, your unread mail highlighted.
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -48,6 +50,12 @@ type icWatch struct {
 	qsel     int
 	open     map[string]bool // expanded questions
 	newestQ  string          // after A: select the next question that appears
+
+	kidsMu  sync.Mutex
+	kids    map[*exec.Cmd]bool // running ic commands; true: kill on exit (a pending ask)
+	kidsWG  sync.WaitGroup
+	closing bool
+	runner  func(args ...string) // tests record commands here instead of running ic
 }
 
 func cmdWatch(args []string) {
@@ -60,24 +68,27 @@ func cmdWatch(args []string) {
 	// The pane acts as the human, whatever shell it was started from.
 	os.Unsetenv("IC_ID")
 	os.Unsetenv("CLAUDECODE")
-	w := &icWatch{stty: strings.TrimSpace(string(st)), results: make(chan string, 8), open: map[string]bool{}}
+	w := &icWatch{stty: strings.TrimSpace(string(st)), results: make(chan string, 8), open: map[string]bool{},
+		kids: map[*exec.Cmd]bool{}}
 	ttyRun("-icanon", "-echo", "min", "1")
-	fmt.Print("\x1b[?1049h\x1b[?25l")
+	fmt.Print("\x1b[?1049h\x1b[?25l\x1b[?2004h") // alternate screen, no cursor, bracketed paste
 	defer func() {
-		fmt.Print("\x1b[?25h\x1b[?1049l")
+		w.finishKids()
+		fmt.Print("\x1b[?2004l\x1b[?25h\x1b[?1049l")
 		ttyRun(w.stty)
+		flushInput(os.Stdin.Fd()) // typed-ahead keys must not reach the shell
 	}()
 
-	keys := make(chan []byte, 16)
+	reads := make(chan []byte, 16)
 	go func() {
-		buf := make([]byte, 64)
+		buf := make([]byte, 4096)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if err != nil {
-				close(keys)
+				close(reads)
 				return
 			}
-			keys <- append([]byte{}, buf[:n]...)
+			reads <- append([]byte{}, buf[:n]...)
 		}
 	}()
 	sigs := make(chan os.Signal, 4)
@@ -86,16 +97,38 @@ func cmdWatch(args []string) {
 	defer tick.Stop()
 	statusTick := 0
 
+	var in inputParser
+	wait := time.NewTimer(time.Hour)
+	wait.Stop()
+	handle := func(events []inputEvent) bool {
+		for _, ev := range events {
+			if ev.isPaste {
+				w.paste(ev.paste)
+			} else if !w.key([]byte(ev.key)) {
+				return false
+			}
+		}
+		if held, d := in.pending(); held {
+			wait.Reset(d)
+		}
+		return true
+	}
+
 	w.size()
 	w.reload(true)
 	w.render()
 	for {
 		select {
-		case k, ok := <-keys:
+		case b, ok := <-reads:
 			if !ok {
 				return
 			}
-			if !feed(k, func() bool { return w.inputOn }, func(one string) bool { return w.key([]byte(one)) }) {
+			wait.Stop()
+			if !handle(in.push(b)) {
+				return
+			}
+		case <-wait.C:
+			if !handle(in.flush()) {
 				return
 			}
 		case s := <-sigs:
@@ -197,13 +230,11 @@ func (w *icWatch) key(b []byte) bool {
 			if len(w.input) > 0 {
 				w.input = w.input[:len(w.input)-1]
 			}
-		case strings.HasPrefix(s, "\x1b"):
+		case s == "\t":
+			w.input = append(w.input, ' ')
+		case strings.HasPrefix(s, "\x1b"): // arrows, F-keys, Alt chords: not text
 		default:
-			for _, r := range strings.ReplaceAll(s, "\n", " ") {
-				if r >= 32 {
-					w.input = append(w.input, r)
-				}
-			}
+			w.input = append(w.input, []rune(clean(s))...)
 		}
 		return true
 	}
@@ -303,22 +334,102 @@ func (w *icWatch) key(b []byte) bool {
 			"    esc / tab   back to the sessions · t hides the pane",
 			"  i           read your messages",
 			"  f           jump to its herdr pane",
-			"  r  q        refresh, quit", "",
+			"  r  q        refresh, quit",
+			"  paste       always text: into the open prompt, or a new draft to the selected agent", "",
 			"any key closes this",
 		}
 	}
 	return true
 }
 
+// paste puts pasted text in the draft and never runs any of it as keys. With no
+// prompt open it starts a message to the selected agent with the text as its
+// draft, which Enter sends and Esc drops.
+func (w *icWatch) paste(text string) {
+	t := pasteText(text)
+	if t == "" {
+		return
+	}
+	if w.inputOn {
+		w.input = append(w.input, []rune(t)...)
+		return
+	}
+	if w.overlay != nil || (w.panel && w.inPanel) {
+		w.msg = "paste ignored: pick a session and press enter first"
+		return
+	}
+	cur := w.sess[w.sel]
+	if cur.Kind == "human" {
+		w.msg = "paste ignored: pick an agent first"
+		return
+	}
+	to := cur.ID
+	w.inputOn, w.prompt, w.input = true, "to "+cur.Name, []rune(t)
+	w.submit = func(t string) { w.run("send", to, t) }
+	w.msg = "pasted into a draft: enter sends it, esc drops it"
+}
+
+// run starts an ic command for the pane. Its last output line shows in the
+// footer. The pane waits for running commands before it exits (see finishKids).
 func (w *icWatch) run(args ...string) {
+	if w.runner != nil {
+		w.runner(args...)
+		return
+	}
 	exe, _ := os.Executable()
 	w.msg = args[0] + "…"
+	full := append([]string{args[0], "--", args[1]}, args[2:]...)
+	cmd := exec.Command(exe, full...)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	// An ask to one session polls until the reply comes; on exit it is
+	// stopped, so the reply stays unread in the inbox instead of vanishing.
+	killOnExit := args[0] == "ask" && args[1] != "all"
+	w.kidsMu.Lock()
+	if w.closing {
+		w.kidsMu.Unlock()
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		w.kidsMu.Unlock()
+		w.msg = err.Error()
+		return
+	}
+	w.kids[cmd] = killOnExit
+	w.kidsWG.Add(1)
+	w.kidsMu.Unlock()
 	go func() {
-		full := append([]string{args[0], "--", args[1]}, args[2:]...)
-		out, _ := exec.Command(exe, full...).CombinedOutput()
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		w.results <- strings.TrimPrefix(lines[len(lines)-1], "ic: ")
+		_ = cmd.Wait()
+		w.kidsMu.Lock()
+		delete(w.kids, cmd)
+		w.kidsMu.Unlock()
+		w.kidsWG.Done()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		select {
+		case w.results <- strings.TrimPrefix(lines[len(lines)-1], "ic: "):
+		default:
+		}
 	}()
+}
+
+// finishKids runs on exit: pending asks are stopped, everything else (a send,
+// an ask to all, a done) gets a few seconds to finish, so quitting right after
+// Enter never loses the message.
+func (w *icWatch) finishKids() {
+	w.kidsMu.Lock()
+	w.closing = true
+	for cmd, kill := range w.kids {
+		if kill {
+			_ = cmd.Process.Kill()
+		}
+	}
+	w.kidsMu.Unlock()
+	done := make(chan struct{})
+	go func() { w.kidsWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
 }
 
 // ---------------------------------------------------------------- drawing
@@ -327,6 +438,7 @@ func cutTo(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
+	s = strings.ReplaceAll(clean(s), "\n", " ")
 	r := []rune(s)
 	if len(r) > n {
 		return string(r[:n-1]) + "…"
@@ -582,7 +694,7 @@ func (w *icWatch) collect() []string {
 
 func (w *icWatch) footer() string {
 	if w.inputOn {
-		return cOrange + cutTo(" "+w.prompt+" › "+string(w.input)+"▏", w.w) + cReset
+		return cOrange + promptLine(w.prompt, w.input, w.w) + cReset
 	}
 	keys := " ↑↓ pick · enter message · a ask · A ask all · d done · t questions · i inbox · f jump · ? help · q quit"
 	if w.panel && w.inPanel {
@@ -654,6 +766,7 @@ func wrap(s string, width int) []string { return wrapN(s, width, 4) }
 
 // wrapN wraps s to width, keeping at most n lines.
 func wrapN(s string, width, n int) []string {
+	s = clean(s)
 	if width < 10 {
 		width = 10
 	}
@@ -685,57 +798,20 @@ func (w *icWatch) flush(lines []string) {
 	fmt.Print("\x1b[H\x1b[2J" + strings.Join(lines, "\r\n"))
 }
 
-// pasteKey keeps a pasted line break from submitting the prompt: while typing,
-// a CR or LF with more bytes after it in the same read is part of a paste, so
-// it becomes a space.
-func pasteKey(typing bool, key string, idx, n int) string {
-	if typing && (key == "\r" || key == "\n") && idx < n-1 {
-		return " "
+// promptLine draws the prompt and draft in width columns. When the draft is
+// too long, its start scrolls off so the end and the cursor stay in view.
+func promptLine(prompt string, input []rune, width int) string {
+	head := " " + prompt + " › "
+	if utf8.RuneCountInString(head) > width/2 {
+		head = cutTo(head, width/2-2) + " › "
 	}
-	return key
-}
-
-// feed hands one terminal read to the pane key by key. Pasted text stays text:
-// line breaks inside it become spaces, and once Enter submits what was typed,
-// the rest of that read is dropped instead of being run as hotkeys. It
-// returns false when the pane should close.
-func feed(read []byte, typing func() bool, key func(string) bool) bool {
-	keys := splitKeys(read)
-	for idx, one := range keys {
-		wasTyping := typing()
-		if !key(pasteKey(wasTyping, one, idx, len(keys))) {
-			return false
-		}
-		if wasTyping && !typing() {
-			break
-		}
+	room := width - utf8.RuneCountInString(head) - 1 // the cursor
+	text := []rune(clean(string(input)))
+	if room < 1 {
+		return cutTo(head, width)
 	}
-	return true
-}
-
-// splitKeys breaks one read into separate keys: escape sequences (arrows)
-// stay whole, everything else is one rune each, so fast typing never merges keys.
-func splitKeys(b []byte) []string {
-	var keys []string
-	for i := 0; i < len(b); {
-		if b[i] == 0x1b && i+2 < len(b) && b[i+1] == '[' {
-			j := i + 2
-			for j < len(b) && (b[j] < 0x40 || b[j] > 0x7e) {
-				j++
-			}
-			if j < len(b) {
-				j++
-			}
-			keys = append(keys, string(b[i:j]))
-			i = j
-			continue
-		}
-		r, size := utf8.DecodeRune(b[i:])
-		if r == utf8.RuneError && size <= 1 {
-			size = 1
-		}
-		keys = append(keys, string(b[i:i+size]))
-		i += size
+	if len(text) > room {
+		text = append([]rune("…"), text[len(text)-room+1:]...)
 	}
-	return keys
+	return head + string(text) + "▏"
 }

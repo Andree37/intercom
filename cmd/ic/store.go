@@ -308,14 +308,14 @@ func drain(s *Session) string {
 		if len(hhmm) >= 16 {
 			hhmm = hhmm[11:16]
 		}
-		fmt.Fprintf(&b, "\n— from %s at %s · msg %s · %s", from, hhmm, m.ID, m.Kind)
+		fmt.Fprintf(&b, "\n— from %s at %s · msg %s · %s", clean(from), hhmm, m.ID, clean(m.Kind))
 		if m.Topic != "" {
-			fmt.Fprintf(&b, " · topic %s", m.Topic)
+			fmt.Fprintf(&b, " · topic %s", clean(m.Topic))
 		}
 		if m.Question != "" && m.Kind == "reply" {
 			fmt.Fprintf(&b, " · answers question %s (close it: ic done %s)", m.Question, m.Question)
 		}
-		fmt.Fprintf(&b, "\n%s\n", m.Body)
+		fmt.Fprintf(&b, "\n%s\n", clean(m.Body))
 		switch {
 		case m.Kind == "ask" && m.Question != "":
 			fmt.Fprintf(&b, "→ Asked to every session (question %s). Answer with: ic reply %s \"...\" "+
