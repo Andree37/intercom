@@ -95,10 +95,8 @@ func cmdWatch(args []string) {
 			if !ok {
 				return
 			}
-			for _, one := range splitKeys(k) {
-				if !w.key([]byte(one)) {
-					return
-				}
+			if !feed(k, func() bool { return w.inputOn }, func(one string) bool { return w.key([]byte(one)) }) {
+				return
 			}
 		case s := <-sigs:
 			if s != syscall.SIGWINCH {
@@ -685,6 +683,34 @@ func (w *icWatch) flush(lines []string) {
 		lines = lines[:w.h]
 	}
 	fmt.Print("\x1b[H\x1b[2J" + strings.Join(lines, "\r\n"))
+}
+
+// pasteKey keeps a pasted line break from submitting the prompt: while typing,
+// a CR or LF with more bytes after it in the same read is part of a paste, so
+// it becomes a space.
+func pasteKey(typing bool, key string, idx, n int) string {
+	if typing && (key == "\r" || key == "\n") && idx < n-1 {
+		return " "
+	}
+	return key
+}
+
+// feed hands one terminal read to the pane key by key. Pasted text stays text:
+// line breaks inside it become spaces, and once Enter submits what was typed,
+// the rest of that read is dropped instead of being run as hotkeys. It
+// returns false when the pane should close.
+func feed(read []byte, typing func() bool, key func(string) bool) bool {
+	keys := splitKeys(read)
+	for idx, one := range keys {
+		wasTyping := typing()
+		if !key(pasteKey(wasTyping, one, idx, len(keys))) {
+			return false
+		}
+		if wasTyping && !typing() {
+			break
+		}
+	}
+	return true
 }
 
 // splitKeys breaks one read into separate keys: escape sequences (arrows)
