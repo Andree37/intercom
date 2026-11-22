@@ -85,8 +85,13 @@ func cmdWatch(args []string) {
 	for {
 		select {
 		case k, ok := <-keys:
-			if !ok || !w.key(k) {
+			if !ok {
 				return
+			}
+			for _, one := range splitKeys(k) {
+				if !w.key([]byte(one)) {
+					return
+				}
 			}
 		case s := <-sigs:
 			if s != syscall.SIGWINCH {
@@ -158,6 +163,8 @@ func (w *icWatch) key(b []byte) bool {
 	s := string(b)
 	if w.inputOn {
 		switch {
+		case s == "\x03":
+			return false
 		case s == "\x1b":
 			w.inputOn, w.msg = false, "cancelled"
 		case s == "\r" || s == "\n":
@@ -179,9 +186,15 @@ func (w *icWatch) key(b []byte) bool {
 		}
 		return true
 	}
+	if s == "q" || s == "\x03" {
+		return false
+	}
 	if w.overlay != nil {
 		w.overlay = nil
 		return true
+	}
+	if s == "\x1b" {
+		return false
 	}
 	cur := w.sess[w.sel]
 	switch s {
@@ -417,4 +430,31 @@ func (w *icWatch) flush(lines []string) {
 		lines = lines[:w.h]
 	}
 	fmt.Print("\x1b[H\x1b[2J" + strings.Join(lines, "\r\n"))
+}
+
+// splitKeys breaks one read into separate keys: escape sequences (arrows)
+// stay whole, everything else is one rune each, so fast typing never merges keys.
+func splitKeys(b []byte) []string {
+	var keys []string
+	for i := 0; i < len(b); {
+		if b[i] == 0x1b && i+2 < len(b) && b[i+1] == '[' {
+			j := i + 2
+			for j < len(b) && (b[j] < 0x40 || b[j] > 0x7e) {
+				j++
+			}
+			if j < len(b) {
+				j++
+			}
+			keys = append(keys, string(b[i:j]))
+			i = j
+			continue
+		}
+		r, size := utf8.DecodeRune(b[i:])
+		if r == utf8.RuneError && size <= 1 {
+			size = 1
+		}
+		keys = append(keys, string(b[i:i+size]))
+		i += size
+	}
+	return keys
 }
