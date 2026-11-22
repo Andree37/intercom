@@ -41,6 +41,13 @@ type icWatch struct {
 	stty     string
 	results  chan string
 	unreadMe int
+	openQs   int
+	panel    bool // the question tracker on the right
+	inPanel  bool // keys go to the tracker, not the sessions
+	qs       []*Question
+	qsel     int
+	open     map[string]bool // expanded questions
+	newestQ  string          // after A: select the next question that appears
 }
 
 func cmdWatch(args []string) {
@@ -53,7 +60,7 @@ func cmdWatch(args []string) {
 	// The pane acts as the human, whatever shell it was started from.
 	os.Unsetenv("IC_ID")
 	os.Unsetenv("CLAUDECODE")
-	w := &icWatch{stty: strings.TrimSpace(string(st)), results: make(chan string, 8)}
+	w := &icWatch{stty: strings.TrimSpace(string(st)), results: make(chan string, 8), open: map[string]bool{}}
 	ttyRun("-icanon", "-echo", "min", "1")
 	fmt.Print("\x1b[?1049h\x1b[?25l")
 	defer func() {
@@ -130,7 +137,7 @@ func (w *icWatch) size() {
 
 func (w *icWatch) signature() string {
 	var b strings.Builder
-	for _, d := range []string{"messages.log", "sessions", filepath.Join("inbox", "human")} {
+	for _, d := range []string{"messages.log", "sessions", "questions", filepath.Join("inbox", "human")} {
 		if info, err := os.Stat(filepath.Join(home(), d)); err == nil {
 			fmt.Fprintf(&b, "%d-%d;", info.ModTime().UnixNano(), info.Size())
 		}
@@ -149,6 +156,22 @@ func (w *icWatch) reload(withStatus bool) {
 		w.status = herdrStatuses()
 	}
 	w.unreadMe = len(unread("human"))
+	w.openQs = len(openQuestions(human.ID))
+	qID := ""
+	if w.qsel < len(w.qs) {
+		qID = w.qs[w.qsel].ID
+	}
+	w.qs = allQuestions(human.ID)
+	w.qsel = 0
+	for k, q := range w.qs {
+		if q.ID == qID {
+			w.qsel = k
+		}
+	}
+	if w.newestQ != "" && len(w.qs) > 0 && w.qs[0].ID != w.newestQ {
+		w.qsel, w.newestQ = 0, ""
+		w.open[w.qs[0].ID] = true
+	}
 	w.sel = 0
 	for k, s := range w.sess {
 		if s.ID == selID {
@@ -193,6 +216,9 @@ func (w *icWatch) key(b []byte) bool {
 		w.overlay = nil
 		return true
 	}
+	if w.panel && w.inPanel && w.panelKey(s) {
+		return true
+	}
 	if s == "\x1b" {
 		return false
 	}
@@ -223,6 +249,31 @@ func (w *icWatch) key(b []byte) bool {
 		w.inputOn, w.prompt, w.input = true, "ask "+cur.Name+" (waits for the reply)", nil
 		to := cur.ID
 		w.submit = func(t string) { w.run("ask", to, t) }
+	case "A":
+		w.inputOn, w.prompt, w.input = true, "ask every session (close with d once answered)", nil
+		w.submit = func(t string) {
+			w.panel, w.inPanel, w.newestQ = true, true, ""
+			if len(w.qs) > 0 {
+				w.newestQ = w.qs[0].ID
+			} else {
+				w.newestQ = "-"
+			}
+			w.run("ask", "all", t)
+		}
+	case "d":
+		qs := openQuestions(human.ID)
+		if len(qs) == 0 {
+			w.msg = "no open questions"
+			break
+		}
+		w.run("done", qs[0].ID)
+	case "t":
+		w.panel = !w.panel
+		w.inPanel = w.panel
+	case "\t":
+		if w.panel {
+			w.inPanel = true
+		}
 	case "i":
 		text := drain(human)
 		if text == "" {
@@ -243,6 +294,15 @@ func (w *icWatch) key(b []byte) bool {
 			"  ↑ ↓ / j k   pick a session",
 			"  enter / s   message it (delivered at its next safe moment)",
 			"  a           ask it and wait for the reply",
+			"  A           ask every session at once",
+			"  d           close your newest question to all (unseen copies vanish)",
+			"  t           show/hide the questions-to-all pane (focuses it)",
+			"  tab         switch between sessions and that pane", "",
+			"  in the questions pane:",
+			"    ↑ ↓ / j k   pick a question",
+			"    enter       expand it: who has seen it, every answer",
+			"    d           close it (unseen copies vanish)",
+			"    esc / tab   back to the sessions · t hides the pane",
 			"  i           read your messages",
 			"  f           jump to its herdr pane",
 			"  r  q        refresh, quit", "",
@@ -289,12 +349,197 @@ func statusColor(st string) string {
 }
 
 func (w *icWatch) render() {
+	if !w.panel || w.overlay != nil {
+		w.renderMain()
+		return
+	}
+	full := w.w
+	if full < 70 && !w.inPanel { // too narrow to split: show whichever side has focus
+		w.renderMain()
+		return
+	}
+	if full < 70 {
+		out := w.tracker(full, w.h-1)
+		out = append(out, w.footer())
+		w.flush(out)
+		return
+	}
+	right := full * 42 / 100
+	left := full - right - 3
+	w.w = left
+	main := w.collect()
+	w.w = full
+	side := w.tracker(right, len(main)-1)
+	for k := 0; k < len(main)-1; k++ {
+		pad := strings.Repeat(" ", max(0, left-visLen(main[k])))
+		r := ""
+		if k < len(side) {
+			r = side[k]
+		}
+		main[k] += pad + cDim + " │ " + cReset + r
+	}
+	main[len(main)-1] = w.footer()
+	w.flush(main)
+}
+
+func (w *icWatch) renderMain() { w.flush(w.collect()) }
+
+// visLen is a line's width on screen, ignoring color codes.
+func visLen(s string) int {
+	n, esc := 0, false
+	for _, r := range s {
+		switch {
+		case esc:
+			if r >= 0x40 && r <= 0x7e && r != '[' {
+				esc = false
+			}
+		case r == 0x1b:
+			esc = true
+		default:
+			n++
+		}
+	}
+	return n
+}
+
+// panelKey handles a key while the questions pane has focus. False means
+// the key is not the pane's and the sessions should handle it.
+func (w *icWatch) panelKey(s string) bool {
+	switch s {
+	case "\x1b", "\t":
+		w.inPanel = false
+	case "\x1b[A", "k":
+		if w.qsel > 0 {
+			w.qsel--
+		}
+	case "\x1b[B", "j":
+		if w.qsel < len(w.qs)-1 {
+			w.qsel++
+		}
+	case "\r", "\n", " ":
+		if w.qsel < len(w.qs) {
+			id := w.qs[w.qsel].ID
+			w.open[id] = !w.open[id]
+		}
+	case "d":
+		if w.qsel >= len(w.qs) {
+			w.msg = "no questions"
+		} else if q := w.qs[w.qsel]; q.Closed != "" {
+			w.msg = "already closed"
+		} else {
+			w.run("done", q.ID)
+		}
+	case "t":
+		w.panel, w.inPanel = false, false
+	default:
+		return false
+	}
+	return true
+}
+
+// tracker draws your questions to all, newest first; expanded ones show who
+// has seen them and every answer. The selected one stays in view.
+func (w *icWatch) tracker(width, rows int) []string {
+	var out []string
+	add := func(color, plain string) { out = append(out, color+cutTo(plain, width)+cReset) }
+	title := " questions to all"
+	if w.inPanel {
+		title += " · ↑↓ enter d · esc back"
+	} else {
+		title += " · tab to focus"
+	}
+	add(cBold, title)
+	add(cDim, strings.Repeat("─", width))
+	if len(w.qs) == 0 {
+		add(cDim, " none yet · press A to ask every session")
+		return out
+	}
+	selStart := 0
+	for k, q := range w.qs {
+		rs := q.recipients()
+		answered := 0
+		for _, r := range rs {
+			if r.State == "answered" {
+				answered++
+			}
+		}
+		mark, color := "●", cOrange
+		if q.Closed != "" {
+			mark, color = "✓", cGreen
+		}
+		arrow := "▸"
+		if w.open[q.ID] {
+			arrow = "▾"
+		}
+		line := fmt.Sprintf(" %s %s %s %d/%d  %s", arrow, mark, q.Time[11:16], answered, len(rs), oneLine(q.Body))
+		if k == w.qsel {
+			selStart = len(out)
+			line = cutTo(line, width)
+			line += strings.Repeat(" ", max(0, width-utf8.RuneCountInString(line)))
+			if w.inPanel {
+				color = cRev + color
+			} else {
+				color = cBold + color
+			}
+		}
+		add(color, line)
+		if !w.open[q.ID] {
+			continue
+		}
+		state := "open · d closes it, unseen copies vanish"
+		if q.Closed != "" {
+			state = "closed " + q.Closed[11:16]
+		}
+		add(cDim, "     "+state)
+		for _, l := range wrapN(q.Body, width-6, 8) {
+			add(cBold, "     "+l)
+		}
+		for _, r := range rs {
+			c := cDim
+			switch r.State {
+			case "answered":
+				c = cGreen
+			case "seen":
+				c = cBlue
+			case "unseen":
+				c = cOrange
+			}
+			tag := r.State
+			if r.Time != "" {
+				tag += " " + r.Time[11:16]
+			}
+			add(c, fmt.Sprintf("     %-14s %s", cutTo(r.Name, 14), tag))
+			for _, l := range wrapN(r.Answer, width-8, 12) {
+				add("", "       "+l)
+			}
+		}
+		add("", "")
+	}
+	// keep the selected question in view below the title
+	if body := rows - 2; len(out) > rows && selStart >= 2 {
+		skip := 0
+		if selStart-2 >= body/3 {
+			skip = min(selStart-2-body/3+1, len(out)-rows)
+		}
+		out = append(out[:2], out[2+max(0, skip):]...)
+	}
+	if len(out) > rows {
+		out = append(out[:rows-1], cDim+cutTo(" …", width)+cReset)
+	}
+	return out
+}
+
+// collect builds the main view: sessions, messages and the key line.
+func (w *icWatch) collect() []string {
 	var out []string
 	add := func(color, plain string) { out = append(out, color+cutTo(plain, w.w)+cReset) }
 
 	head := fmt.Sprintf(" intercom · %d session(s)", len(w.sess)-1)
 	if w.unreadMe > 0 {
 		head += fmt.Sprintf("   ✉ %d for you (i)", w.unreadMe)
+	}
+	if w.openQs > 0 {
+		head += fmt.Sprintf("   ? %d open question(s) (d closes newest)", w.openQs)
 	}
 	add(cBold, head)
 	add(cDim, strings.Repeat("─", w.w))
@@ -304,8 +549,7 @@ func (w *icWatch) render() {
 				add("", " "+l)
 			}
 		}
-		w.flush(out)
-		return
+		return out
 	}
 
 	h, _ := os.UserHomeDir()
@@ -335,12 +579,20 @@ func (w *icWatch) render() {
 	for len(out) < w.h-1 {
 		out = append(out, "")
 	}
+	return append(out, w.footer())
+}
+
+func (w *icWatch) footer() string {
 	if w.inputOn {
-		add(cOrange, " "+w.prompt+" › "+string(w.input)+"▏")
-	} else {
-		add(cDim, " ↑↓ pick · enter message · a ask · i inbox · f jump · ? help · q quit   "+w.msg)
+		return cOrange + cutTo(" "+w.prompt+" › "+string(w.input)+"▏", w.w) + cReset
 	}
-	w.flush(out)
+	keys := " ↑↓ pick · enter message · a ask · A ask all · d done · t questions · i inbox · f jump · ? help · q quit"
+	if w.panel && w.inPanel {
+		keys = " questions: ↑↓ pick · enter expand · d close it · A ask all · esc/tab sessions · t hide · q quit"
+	} else if w.panel {
+		keys = " ↑↓ pick · enter message · a ask · A ask all · tab questions · t hide · i inbox · ? help · q quit"
+	}
+	return cDim + cutTo(keys+"   "+w.msg, w.w) + cReset
 }
 
 // messages renders the last messages that fit, wrapped, newest at the bottom.
@@ -400,7 +652,10 @@ func (w *icWatch) messages(room int) []string {
 	return out
 }
 
-func wrap(s string, width int) []string {
+func wrap(s string, width int) []string { return wrapN(s, width, 4) }
+
+// wrapN wraps s to width, keeping at most n lines.
+func wrapN(s string, width, n int) []string {
 	if width < 10 {
 		width = 10
 	}
@@ -419,8 +674,8 @@ func wrap(s string, width int) []string {
 	if line != "" {
 		out = append(out, line)
 	}
-	if len(out) > 4 {
-		out = append(out[:4], "…")
+	if len(out) > n {
+		out = append(out[:n], "…")
 	}
 	return out
 }

@@ -74,7 +74,7 @@ func cmdName(args []string) {
 }
 
 // send writes a message and wakes the recipient if that is safe.
-func send(to, kind, re, topic, body string, wake bool) *Message {
+func send(to, kind, re, topic, question, body string, wake bool) *Message {
 	if strings.TrimSpace(body) == "" {
 		die("empty message")
 	}
@@ -86,7 +86,7 @@ func send(to, kind, re, topic, body string, wake bool) *Message {
 	if dst.ID == me.ID {
 		die("that is you")
 	}
-	m := &Message{ID: newID(), From: me.ID, To: dst.ID, Time: now(), Kind: kind, Re: re, Topic: topic, Body: body}
+	m := &Message{ID: newID(), From: me.ID, To: dst.ID, Time: now(), Kind: kind, Re: re, Topic: topic, Question: question, Body: body}
 	if err := m.deliver(); err != nil {
 		die("%v", err)
 	}
@@ -104,20 +104,28 @@ func cmdSend(args []string) {
 	if len(args) < 2 {
 		die("usage: ic send TO TEXT... [--topic T] [--no-wake]")
 	}
-	send(args[0], "send", "", topic, joinText(args[1:]), !noWake)
+	if strings.EqualFold(args[0], "all") {
+		die("to reach everyone, ask a question: ic ask all TEXT...")
+	}
+	send(args[0], "send", "", topic, "", joinText(args[1:]), !noWake)
 }
 
 func cmdAsk(args []string) {
 	topic, _, args := flag(args, "topic", true)
 	tv, _, args := flag(args, "timeout", true)
+	_, noWake, args := flag(args, "no-wake", false)
 	if len(args) < 2 {
 		die("usage: ic ask TO TEXT... [--timeout SECONDS] [--topic T]")
+	}
+	if strings.EqualFold(args[0], "all") { // answers arrive as messages; close with `ic done`
+		askAll(joinText(args[1:]), topic, !noWake)
+		return
 	}
 	timeout := 100 // stays under an agent's default 2-minute tool limit
 	if n, err := strconv.Atoi(tv); err == nil && n > 0 {
 		timeout = n
 	}
-	q := send(args[0], "ask", "", topic, joinText(args[1:]), true)
+	q := send(args[0], "ask", "", topic, "", joinText(args[1:]), !noWake)
 	me := self()
 	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 	for time.Now().Before(deadline) {
@@ -156,7 +164,10 @@ func cmdReply(args []string) {
 	if orig == nil {
 		die("no message %s in your inbox", id)
 	}
-	send(orig.From, "reply", orig.ID, orig.Topic, joinText(args[1:]), true)
+	if orig.Question != "" && questionClosed(orig.Question) {
+		die("question %s is closed: it was already answered. No reply needed; drop it.", orig.Question)
+	}
+	send(orig.From, "reply", orig.ID, orig.Topic, orig.Question, joinText(args[1:]), true)
 }
 
 func cmdInbox(args []string) {

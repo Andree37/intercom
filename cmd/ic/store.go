@@ -5,6 +5,7 @@ package main
 //	sessions/<id>                 "key value" lines, one session each
 //	inbox/<id>/<msg>.msg          unread messages ("key value" header, blank line, body)
 //	inbox/<id>/read/<msg>.msg     delivered messages
+//	questions/<id>                one question asked to everyone ("key value" header, blank line, body)
 //	messages.log                  one tab-separated line per message, for `ic log`
 
 import (
@@ -212,11 +213,11 @@ func resolve(to string, me *Session) (*Session, error) {
 // ---------------------------------------------------------------- messages
 
 type Message struct {
-	ID, From, To, Time, Kind, Re, Topic string
-	Body                                string
+	ID, From, To, Time, Kind, Re, Topic, Question string
+	Body                                          string
 }
 
-var messageKeys = []string{"id", "from", "to", "time", "kind", "re", "topic"}
+var messageKeys = []string{"id", "from", "to", "time", "kind", "re", "topic", "question"}
 
 func newID() string {
 	b := make([]byte, 3)
@@ -227,16 +228,26 @@ func newID() string {
 func inboxDir(id string) string { return filepath.Join(home(), "inbox", id) }
 
 func (m *Message) deliver() error {
-	kv := map[string]string{"id": m.ID, "from": m.From, "to": m.To, "time": m.Time, "kind": m.Kind, "re": m.Re, "topic": m.Topic}
-	if err := writeKV(filepath.Join(inboxDir(m.To), m.ID+".msg"), messageKeys, kv, m.Body); err != nil {
+	if err := m.store(); err != nil {
 		return err
 	}
+	m.log(m.To)
+	return nil
+}
+
+// store writes the message into its recipient's inbox without logging it.
+func (m *Message) store() error {
+	kv := map[string]string{"id": m.ID, "from": m.From, "to": m.To, "time": m.Time, "kind": m.Kind, "re": m.Re, "topic": m.Topic, "question": m.Question}
+	return writeKV(filepath.Join(inboxDir(m.To), m.ID+".msg"), messageKeys, kv, m.Body)
+}
+
+// log appends the message to messages.log, addressed to `to` (an id, or "all").
+func (m *Message) log(to string) {
 	f, err := os.OpenFile(filepath.Join(home(), "messages.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err == nil {
-		fmt.Fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\n", m.Time, m.From, m.To, m.ID, m.Kind, oneLine(m.Body))
+		fmt.Fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\n", m.Time, m.From, to, m.ID, m.Kind, oneLine(m.Body))
 		f.Close()
 	}
-	return nil
 }
 
 func readMessage(path string) *Message {
@@ -244,7 +255,7 @@ func readMessage(path string) *Message {
 	if err != nil {
 		return nil
 	}
-	return &Message{kv["id"], kv["from"], kv["to"], kv["time"], kv["kind"], kv["re"], kv["topic"], strings.TrimRight(body, "\n")}
+	return &Message{kv["id"], kv["from"], kv["to"], kv["time"], kv["kind"], kv["re"], kv["topic"], kv["question"], strings.TrimRight(body, "\n")}
 }
 
 // unread lists a session's unread messages, oldest first.
@@ -274,6 +285,18 @@ func drain(s *Session) string {
 	if len(msgs) == 0 {
 		return ""
 	}
+	var live []*Message
+	for _, m := range msgs {
+		if m.Question != "" && m.Kind == "ask" && questionClosed(m.Question) {
+			_ = os.Remove(filepath.Join(inboxDir(m.To), m.ID+".msg")) // answered elsewhere: never shown
+			continue
+		}
+		live = append(live, m)
+	}
+	if len(live) == 0 {
+		return ""
+	}
+	msgs = live
 	var b strings.Builder
 	fmt.Fprintf(&b, "[intercom] %d new message(s) for you (%s):\n", len(msgs), s.Name)
 	for _, m := range msgs {
@@ -289,11 +312,17 @@ func drain(s *Session) string {
 		if m.Topic != "" {
 			fmt.Fprintf(&b, " · topic %s", m.Topic)
 		}
+		if m.Question != "" && m.Kind == "reply" {
+			fmt.Fprintf(&b, " · answers question %s (close it: ic done %s)", m.Question, m.Question)
+		}
 		fmt.Fprintf(&b, "\n%s\n", m.Body)
-		switch m.Kind {
-		case "ask":
+		switch {
+		case m.Kind == "ask" && m.Question != "":
+			fmt.Fprintf(&b, "→ Asked to every session (question %s). Answer with: ic reply %s \"...\" "+
+				"If it gets closed before you answer, you'll be told; then drop it.\n", m.Question, m.ID)
+		case m.Kind == "ask":
 			fmt.Fprintf(&b, "→ They are waiting for an answer: ic reply %s \"...\"\n", m.ID)
-		case "send":
+		case m.Kind == "send":
 			fmt.Fprintf(&b, "→ Reply if useful: ic reply %s \"...\"\n", m.ID)
 		}
 		markRead(m)
